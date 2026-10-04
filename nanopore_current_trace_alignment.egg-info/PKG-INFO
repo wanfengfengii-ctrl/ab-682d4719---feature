@@ -37,6 +37,15 @@ Description-Content-Type: text/markdown
 | `residual_limit` | int | 残差上限（非负） |
 | `dwell_min` / `dwell_max` | int，可选 | 每级停留采样范围，默认 1–3（1 ≤ … ≤ 3） |
 | `max_skips` | int，可选 | 内部跳过上限，默认 2（0–2） |
+| `dropout_runs` | 对象数组，可选 | 量程复位缺口，每项 `{"start": int, "end": int}`（零基半开区间）；1–3 个互不重叠且按序排列的区间，无效采样总数 ≤ 6 |
+
+`dropout_runs` 标记采集卡量程自动复位留下的连续无效采样。启用后：
+缺口样本仍计入停留长度并恰好归属一个采用电平；同一缺口不会被
+采样边界切开；占位观测不参与残差（不计入 `residual_sum` /
+`max_abs_residual`，也不受 `residual_limit` 约束）；每个采用电平
+至少包含一个有效样本。若只有拆开缺口或让某级完全由无效采样支撑
+才能对齐，返回既有的明确无解结论。未提供该字段时，请求、裁决与
+响应语义与既有版本完全一致。
 
 成功（HTTP 200）返回：
 
@@ -66,7 +75,10 @@ Description-Content-Type: text/markdown
 ```
 
 * `boundaries`：内部连续采样边界（不含 0 与末尾 N）；
-* `levels[].samples[]`：逐级残差证据，覆盖每个观测恰好一次。
+* `levels[].samples[]`：逐级残差证据，覆盖每个观测恰好一次；
+  缺口占位样本标记为
+  `{"index": t, "observed": ..., "residual": null, "dropout": true}`，
+  其归属即所在电平的采样区间。
 
 任何合法对齐都不存在时仍返回 HTTP 200，但给出明确无解结论：
 
@@ -92,7 +104,7 @@ python verify/verify.py
 NANOPORE_HOST_PORT=9090 docker compose up -d --build api
 
 # 一次性验证服务：包构建 → 代码测试 → 可行/无解/非法 HTTP 冒烟
-# 以退出码汇报（0 全部通过）
+# （含缺口占位场景），以退出码汇报（0 全部通过）
 docker compose up --build verify
 ```
 
@@ -103,4 +115,6 @@ docker compose up --build verify
 首级强制为 `R[0]`、末级强制为 `R[R-1]`；采样块的可行漂移区间
 `[max(O−R) − lim, min(O−R) + lim]` 与漂移无关、一次性预计算，
 并以首末级可行区间交集预筛漂移；边界序列以 64 为基编码为整数，
-字典序平局裁决即整数比较。
+字典序平局裁决即整数比较。启用 `dropout_runs` 时，切开缺口或
+全无有效样本的采样块在预计算阶段直接剔除，缺口观测不进入残差
+统计，DP 与五级裁决随之自然生效。

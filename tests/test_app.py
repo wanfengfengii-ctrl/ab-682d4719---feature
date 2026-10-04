@@ -31,6 +31,17 @@ INFEASIBLE_PAYLOAD: Dict[str, Any] = {
     "residual_limit": 1,
 }
 
+DROPOUT_PAYLOAD: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [10, 20, 999, 30, 40, 50, 60, 70, 80],
+    "drift_min": -2,
+    "drift_max": 2,
+    "residual_limit": 0,
+    "dwell_min": 1,
+    "dwell_max": 3,
+    "dropout_runs": [{"start": 2, "end": 3}],
+}
+
 
 class AlignFromPayloadTests(unittest.TestCase):
     def test_feasible(self) -> None:
@@ -80,6 +91,94 @@ class AlignFromPayloadTests(unittest.TestCase):
         status, body = align_from_payload("not-a-dict")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_body")
+
+
+class DropoutPayloadTests(unittest.TestCase):
+    """dropout_runs 字段：接收、转换、求解与字段级拒绝。"""
+
+    def test_feasible_with_dropout(self) -> None:
+        status, body = align_from_payload(DROPOUT_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["residual_sum"], 0)
+        drops = [
+            (lv["level_order"], s)
+            for lv in body["levels"]
+            for s in lv["samples"]
+            if s.get("dropout")
+        ]
+        self.assertEqual(len(drops), 1)
+        level_order, sample = drops[0]
+        self.assertEqual(sample["index"], 2)
+        self.assertIsNone(sample["residual"])
+        # 归属：缺口样本落在其采用电平的采样区间内。
+        lv = body["levels"][level_order]
+        self.assertLessEqual(lv["sample_start"], 2)
+        self.assertLess(2, lv["sample_end"])
+
+    def test_dropout_infeasible_is_explicit_conclusion(self) -> None:
+        # 有效样本不足以让每个采用电平至少含一个 -> 既有无解结论。
+        bad = dict(DROPOUT_PAYLOAD)
+        bad["observations"] = [10, 20, 999, 999, 999, 60, 70, 80]
+        bad["residual_limit"] = 2
+        bad["dropout_runs"] = [{"start": 2, "end": 5}]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"], "no_alignment_exists")
+
+    def test_overlap_rejected(self) -> None:
+        bad = dict(DROPOUT_PAYLOAD)
+        bad["dropout_runs"] = [{"start": 1, "end": 3}, {"start": 2, "end": 4}]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_out_of_range_rejected(self) -> None:
+        bad = dict(DROPOUT_PAYLOAD)
+        bad["dropout_runs"] = [{"start": 6, "end": 9}]  # N=9 时 end=9 合法，
+        status, _ = align_from_payload(bad)  # 恰好覆盖末样本，允许。
+        self.assertEqual(status, 200)
+        bad["dropout_runs"] = [{"start": 6, "end": 10}]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+        bad["dropout_runs"] = [{"start": -1, "end": 2}]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+
+    def test_too_many_runs_rejected(self) -> None:
+        bad = dict(DROPOUT_PAYLOAD)
+        bad["dropout_runs"] = [
+            {"start": 0, "end": 1},
+            {"start": 2, "end": 3},
+            {"start": 4, "end": 5},
+            {"start": 6, "end": 7},
+        ]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_too_many_dropout_samples_rejected(self) -> None:
+        bad = dict(DROPOUT_PAYLOAD)
+        bad["dropout_runs"] = [{"start": 0, "end": 4}, {"start": 4, "end": 7}]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_malformed_run_items_rejected(self) -> None:
+        for runs in (
+            "not-a-list",
+            [{"start": 0}],
+            [{"start": 0, "end": 1, "extra": 2}],
+            [[0, 1]],
+            [1],
+        ):
+            bad = dict(DROPOUT_PAYLOAD)
+            bad["dropout_runs"] = runs
+            status, body = align_from_payload(bad)
+            self.assertEqual(status, 400, msg=f"dropout_runs={runs}")
+            self.assertEqual(body["error"], "invalid_request")
 
 
 class HttpEndToEndTests(unittest.TestCase):

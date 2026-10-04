@@ -19,10 +19,16 @@ def brute_force(
     dwell_min: int,
     dwell_max: int,
     max_skips: int,
+    dropout_runs: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> Optional[dict]:
     """穷举所有漂移 / 含首尾子序列 / 停留组合，返回与 solve 同口径的最优解。"""
     R = len(reference)
     N = len(observations)
+    runs = list(dropout_runs or [])
+    is_dropout = [False] * N
+    for a, b in runs:
+        for t in range(a, b):
+            is_dropout[t] = True
     best: Optional[Tuple] = None
 
     for d in range(drift_min, drift_max + 1):
@@ -45,17 +51,32 @@ def brute_force(
                     ok = True
                     s = 0
                     for ri, L in zip(used, dwells):
+                        e = s + L
+                        # 同一缺口不得被采样边界切开。
+                        for a, b in runs:
+                            if s < b and a < e and not (s <= a and b <= e):
+                                ok = False
+                                break
+                        if not ok:
+                            break
                         level = reference[ri] + d
-                        for t in range(s, s + L):
+                        valid = 0
+                        for t in range(s, e):
+                            if is_dropout[t]:
+                                continue
+                            valid += 1
                             r = abs(observations[t] - level)
                             if r > residual_limit:
                                 ok = False
                                 break
                             total += r
                             worst = max(worst, r)
+                        # 每个采用电平至少包含一个有效样本。
+                        if valid == 0:
+                            ok = False
                         if not ok:
                             break
-                        s += L
+                        s = e
                     if not ok:
                         continue
                     cost = (skip_count, total, worst, d, boundaries)
@@ -86,6 +107,7 @@ def _assert_matches_brute(
     dwell_min: int = 1,
     dwell_max: int = 3,
     max_skips: int = 2,
+    dropout_runs: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> None:
     got = solve_alignment(
         reference,
@@ -96,6 +118,7 @@ def _assert_matches_brute(
         dwell_min,
         dwell_max,
         max_skips,
+        dropout_runs,
     )
     want = brute_force(
         reference,
@@ -106,6 +129,7 @@ def _assert_matches_brute(
         dwell_min,
         dwell_max,
         max_skips,
+        dropout_runs,
     )
     if want is None:
         testcase.assertFalse(got["feasible"], msg=f"意外可行: {got}")
@@ -499,6 +523,241 @@ class WideDriftRandomTests(unittest.TestCase):
             if sum(parts) == n:
                 return parts
         return None
+
+
+class DropoutTests(unittest.TestCase):
+    """缺口占位：不计残差、计入停留、不拆缺口、每级至少一个有效样本。"""
+
+    REF = [10, 20, 30, 40, 50, 60, 70, 80]
+
+    def test_dropout_excluded_from_residual(self) -> None:
+        # 占位值 999 若参与残差必然超限（limit=0）；标记缺口后零残差对齐。
+        obs = [10, 20, 999, 30, 40, 50, 60, 70, 80]
+        res = solve_alignment(
+            self.REF, obs, -2, 2, 0, dwell_min=1, dwell_max=3,
+            dropout_runs=[(2, 3)],
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["drift"], 0)
+        self.assertEqual(res["residual_sum"], 0)
+        self.assertEqual(res["max_abs_residual"], 0)
+        # 缺口 t=2 可归第 2 或第 3 级，字典序裁决取边界 (1,2,4,...)。
+        self.assertEqual(res["boundaries"], [1, 2, 4, 5, 6, 7, 8])
+        lv = res["levels"][2]
+        self.assertEqual(lv["reference_index"], 2)
+        # 缺口样本计入停留长度。
+        self.assertEqual(lv["dwell"], 2)
+        self.assertEqual(lv["sample_start"], 2)
+        self.assertEqual(lv["sample_end"], 4)
+        drop = lv["samples"][0]
+        self.assertEqual(drop["index"], 2)
+        self.assertEqual(drop["observed"], 999)
+        self.assertIsNone(drop["residual"])
+        self.assertTrue(drop["dropout"])
+        # 有效样本保持原格式，不带 dropout 键。
+        valid = lv["samples"][1]
+        self.assertNotIn("dropout", valid)
+        self.assertEqual(valid["residual"], 0)
+        # 全部样本（含缺口）仍恰好覆盖一次。
+        covered = [s["index"] for lv in res["levels"] for s in lv["samples"]]
+        self.assertEqual(covered, list(range(len(obs))))
+
+    def test_multiple_runs_each_assigned_to_one_level(self) -> None:
+        obs = [10, 999, 20, 30, 999, 40, 50, 60, 70, 80]
+        res = solve_alignment(
+            self.REF, obs, -2, 2, 0, dwell_min=1, dwell_max=3,
+            dropout_runs=[(1, 2), (4, 5)],
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["residual_sum"], 0)
+        self.assertEqual(res["boundaries"], [1, 3, 4, 6, 7, 8, 9])
+        drops = [
+            (lv["level_order"], s["index"])
+            for lv in res["levels"]
+            for s in lv["samples"]
+            if s.get("dropout")
+        ]
+        # 每个缺口恰好归属一个采用电平。
+        self.assertEqual(drops, [(1, 1), (3, 4)])
+
+    def test_run_cannot_be_split_infeasible(self) -> None:
+        # 缺口长度等于 dwell 上限：任何完整包含它的级再无有效样本位置，
+        # 只有拆开缺口才能覆盖 -> 明确无解。
+        obs = [10, 20, 30, 999, 999, 999, 60, 70, 80]
+        res = solve_alignment(
+            self.REF, obs, -2, 2, 2, dwell_min=1, dwell_max=3,
+            dropout_runs=[(3, 6)],
+        )
+        self.assertFalse(res["feasible"])
+        self.assertEqual(res["reason"], "no_alignment_exists")
+
+    def test_level_fully_dropout_infeasible(self) -> None:
+        # 有效样本仅 5 个 < 最少 6 级：除非让某级完全由无效采样支撑。
+        obs = [10, 20, 999, 999, 999, 60, 70, 80]
+        res = solve_alignment(
+            self.REF, obs, -2, 2, 2, dwell_min=1, dwell_max=3,
+            dropout_runs=[(2, 5)],
+        )
+        self.assertFalse(res["feasible"])
+        self.assertEqual(res["reason"], "no_alignment_exists")
+
+    def test_dropout_absent_keeps_legacy_shape(self) -> None:
+        # 未提供 dropout_runs：响应不含任何 dropout 标记。
+        obs = [x + 5 for x in self.REF]
+        res = solve_alignment(self.REF, obs, -10, 10, 2)
+        self.assertTrue(res["feasible"])
+        for lv in res["levels"]:
+            for s in lv["samples"]:
+                self.assertNotIn("dropout", s)
+                self.assertIsInstance(s["residual"], int)
+
+
+class DropoutValidationTests(unittest.TestCase):
+    """dropout_runs 字段级校验：越界、重叠、数量与总数超限均拒绝。"""
+
+    def _base(self) -> dict:
+        return dict(
+            reference=[10, 20, 30, 40, 50, 60, 70, 80],
+            observations=[10, 20, 30, 40, 50, 60, 70, 80],
+            drift_min=0,
+            drift_max=0,
+            residual_limit=0,
+        )
+
+    def test_run_count_bounds(self) -> None:
+        kw = self._base()
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[])
+        with self.assertRaises(AlignmentError):
+            solve_alignment(
+                **kw, dropout_runs=[(0, 1), (1, 2), (2, 3), (3, 4)]
+            )
+
+    def test_range_checks(self) -> None:
+        kw = self._base()
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(-1, 2)])
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(6, 9)])  # N=8，越界
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(3, 3)])  # 空区间
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(5, 4)])
+
+    def test_overlap_and_order(self) -> None:
+        kw = self._base()
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(1, 3), (2, 4)])
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(3, 5), (1, 2)])
+
+    def test_total_samples_cap(self) -> None:
+        kw = self._base()
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(0, 4), (4, 7)])  # 共 7 个
+        # 恰好 6 个无效采样合法（校验通过；此例因有效样本不足而无解）。
+        res = solve_alignment(**kw, dropout_runs=[(0, 3), (3, 6)])
+        self.assertFalse(res["feasible"])
+
+    def test_adjacent_runs_allowed(self) -> None:
+        # 半开区间相邻不算重叠：字段被接受，且两段缺口可同属一级。
+        kw = self._base()
+        kw["observations"] = [10, 20, 999, 999, 50, 60, 70, 80]
+        res = solve_alignment(
+            kw["reference"], kw["observations"], 0, 0, 0,
+            dwell_min=1, dwell_max=3, max_skips=2,
+            dropout_runs=[(2, 3), (3, 4)],
+        )
+        self.assertTrue(res["feasible"])
+        self.assertEqual(res["num_skips"], 2)
+        self.assertEqual(res["residual_sum"], 0)
+        drops = [
+            s["index"]
+            for lv in res["levels"]
+            for s in lv["samples"]
+            if s.get("dropout")
+        ]
+        self.assertEqual(drops, [2, 3])
+
+    def test_type_checks(self) -> None:
+        kw = self._base()
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs="not-a-list")
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(0, 1, 2)])
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(0.5, 2)])
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[(True, 2)])
+        with self.assertRaises(AlignmentError):
+            solve_alignment(**kw, dropout_runs=[1])
+
+
+class DropoutBruteForceComparisonTests(unittest.TestCase):
+    """带缺口的随机小规模实例：DP 必须与穷举结果完全一致。"""
+
+    def test_random_dropout_cases(self) -> None:
+        rng = random.Random(20261005)
+        for trial in range(100):
+            R = rng.randint(8, 10)
+            N = rng.randint(8, 16)
+            ref = [rng.randint(0, 40) for _ in range(R)]
+            # 以随机“真值”对齐生成观测，再把缺口位置改写成占位垃圾值，
+            # 使可行与不可行实例混合出现。
+            inner = list(range(1, R - 1))
+            rng.shuffle(inner)
+            skip_k = rng.randint(0, min(2, R - 2))
+            skipped_set = set(inner[:skip_k])
+            used = [i for i in range(R) if i not in skipped_set]
+            k = len(used)
+            if k > N:
+                used = list(range(R))
+                k = R
+            dwells = BruteForceComparisonTests._random_composition(
+                rng, k, N, 1, 3
+            )
+            if dwells is None:
+                continue
+            d = rng.randint(-3, 3)
+            obs: List[int] = []
+            for ri, L in zip(used, dwells):
+                level = ref[ri] + d
+                for _ in range(L):
+                    noise = rng.choice([0, 0, 0, 1, -1, 2, -2, 5])
+                    obs.append(level + noise)
+            runs = self._random_runs(rng, N)
+            for a, b in runs:
+                for t in range(a, b):
+                    obs[t] = rng.choice([9999, -9999, 123456])
+            limit = rng.choice([0, 1, 2, 3, 10])
+            d_lo = d - rng.randint(0, 3)
+            d_hi = d + rng.randint(0, 3)
+            with self.subTest(trial=trial, ref=ref, obs=obs, runs=runs,
+                              lo=d_lo, hi=d_hi, limit=limit):
+                _assert_matches_brute(
+                    self, ref, obs, d_lo, d_hi, limit, 1, 3, 2, runs
+                )
+
+    @staticmethod
+    def _random_runs(rng: random.Random, n: int) -> List[Tuple[int, int]]:
+        """生成 1..3 个互不重叠、按序、总数 <= 6 的合法缺口区间。"""
+        for _ in range(100):
+            k = rng.randint(1, 3)
+            cand = []
+            for _ in range(k):
+                a = rng.randint(0, n - 1)
+                b = a + rng.randint(1, 3)
+                if b > n:
+                    break
+                cand.append((a, b))
+            else:
+                cand.sort()
+                if all(
+                    cand[i + 1][0] >= cand[i][1]
+                    for i in range(len(cand) - 1)
+                ) and sum(b - a for a, b in cand) <= 6:
+                    return cand
+        return []
 
 
 if __name__ == "__main__":

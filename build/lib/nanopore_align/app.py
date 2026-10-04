@@ -29,6 +29,7 @@ _ALLOWED_FIELDS = {
     "dwell_min",
     "dwell_max",
     "max_skips",
+    "dropout_runs",
 }
 
 _REQUIRED_FIELDS = (
@@ -70,6 +71,21 @@ def align_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         kwargs["dwell_max"] = payload["dwell_max"]
     if "max_skips" in payload:
         kwargs["max_skips"] = payload["max_skips"]
+    if "dropout_runs" in payload:
+        runs = payload["dropout_runs"]
+        if not isinstance(runs, list):
+            return _bad_request(
+                "invalid_request", "dropout_runs 必须为数组"
+            )
+        parsed_runs = []
+        for item in runs:
+            if not isinstance(item, dict) or set(item) != {"start", "end"}:
+                return _bad_request(
+                    "invalid_request",
+                    "dropout_runs 每项必须为含 start、end 的对象",
+                )
+            parsed_runs.append((item["start"], item["end"]))
+        kwargs["dropout_runs"] = parsed_runs
 
     try:
         result = solve_alignment(**kwargs)

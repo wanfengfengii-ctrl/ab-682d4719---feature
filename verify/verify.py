@@ -8,7 +8,11 @@
 3. HTTP 冒烟：对运行中的 API 提交
    - 一条可行轨迹（期望 feasible=true、漂移/区间/残差证据齐全），
    - 一条无解轨迹（期望 feasible=false 且给出明确结论），
-   - 一条非法请求（期望 HTTP 400）。
+   - 一条非法请求（期望 HTTP 400），
+   - 一条带缺口占位的可行轨迹（期望占位观测被标记且不参与残差），
+   - 一条只有让某级完全由无效采样支撑才能对齐的轨迹
+     （期望 feasible=false 且给出明确结论），
+   - 三条非法 dropout_runs（越界 / 重叠 / 总数超限，期望 HTTP 400）。
 
 API 地址取环境变量 ``API_BASE_URL``（compose 中为 http://api:8000）；
 若该地址不可达且未显式要求使用远端服务，则在本地以随机端口临时启动
@@ -55,6 +59,41 @@ INVALID_CASE: Dict[str, Any] = {
     "drift_min": 0,
     "drift_max": 0,
     "residual_limit": 0,
+}
+
+# 缺口场景：两个 dropout 区间，占位值 999 若参与残差必超限（limit=0）。
+DROPOUT_FEASIBLE_CASE: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [10, 999, 20, 30, 999, 40, 50, 60, 70, 80],
+    "drift_min": -2,
+    "drift_max": 2,
+    "residual_limit": 0,
+    "dwell_min": 1,
+    "dwell_max": 3,
+    "dropout_runs": [{"start": 1, "end": 2}, {"start": 4, "end": 5}],
+}
+
+# 有效样本仅 5 个 < 最少 6 级：只有让某级完全由无效采样支撑才能对齐。
+DROPOUT_INFEASIBLE_CASE: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [10, 20, 999, 999, 999, 60, 70, 80],
+    "drift_min": -2,
+    "drift_max": 2,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 3,
+    "dropout_runs": [{"start": 2, "end": 5}],
+}
+
+# 非法 dropout_runs：越界 / 重叠 / 无效采样总数超限。
+DROPOUT_INVALID_CASES: Dict[str, Dict[str, Any]] = {
+    "out_of_range": {"dropout_runs": [{"start": 7, "end": 11}]},
+    "overlap": {
+        "dropout_runs": [{"start": 1, "end": 3}, {"start": 2, "end": 4}]
+    },
+    "too_many_samples": {
+        "dropout_runs": [{"start": 0, "end": 4}, {"start": 4, "end": 7}]
+    },
 }
 
 
@@ -212,6 +251,56 @@ def stage_http_smoke(base_url: str) -> None:
     if status != 400:
         raise StageFailure(f"非法请求应返回 400，实际 status={status}")
     _log("smoke", "非法请求通过: 返回 HTTP 400 拒绝")
+
+    # 缺口场景：占位观测被标记、归属单一电平且不参与残差。
+    status, body = _http_request(base_url, DROPOUT_FEASIBLE_CASE)
+    if status != 200 or not body.get("feasible"):
+        raise StageFailure(
+            f"缺口可行轨迹用例失败: status={status} body={body}"
+        )
+    if body.get("residual_sum") != 0 or body.get("max_abs_residual") != 0:
+        raise StageFailure("缺口占位观测参与了残差统计")
+    levels = body.get("levels") or []
+    covered = [s["index"] for lv in levels for s in lv["samples"]]
+    if covered != list(range(len(DROPOUT_FEASIBLE_CASE["observations"]))):
+        raise StageFailure("缺口轨迹未恰好覆盖每个观测一次")
+    dropout_hits = [
+        (lv, s)
+        for lv in levels
+        for s in lv["samples"]
+        if s.get("dropout")
+    ]
+    if sorted(s["index"] for _, s in dropout_hits) != [1, 4]:
+        raise StageFailure("缺口样本未在逐样本证据中逐一标明")
+    for lv, s in dropout_hits:
+        if s.get("residual") is not None:
+            raise StageFailure("缺口样本不应携带残差值")
+        if not (lv["sample_start"] <= s["index"] < lv["sample_end"]):
+            raise StageFailure("缺口样本未归属其采用电平的采样区间")
+    _log(
+        "smoke",
+        f"缺口可行轨迹通过: drift={body['drift']} "
+        f"dropouts={[s['index'] for _, s in dropout_hits]} 已标记且不计残差",
+    )
+
+    status, body = _http_request(base_url, DROPOUT_INFEASIBLE_CASE)
+    if status != 200 or body.get("feasible") is not False:
+        raise StageFailure(
+            f"缺口无解轨迹用例失败: status={status} body={body}"
+        )
+    if body.get("reason") != "no_alignment_exists":
+        raise StageFailure("缺口无解轨迹缺少明确结论 reason")
+    _log("smoke", "缺口无解轨迹通过: 全无效级支撑被拒绝并给出明确结论")
+
+    for name, patch in DROPOUT_INVALID_CASES.items():
+        payload = dict(DROPOUT_FEASIBLE_CASE)
+        payload.update(patch)
+        status, body = _http_request(base_url, payload)
+        if status != 400:
+            raise StageFailure(
+                f"非法 dropout_runs（{name}）应返回 400，实际 status={status}"
+            )
+    _log("smoke", "非法 dropout_runs 通过: 越界/重叠/总数超限均返回 400")
 
 
 def main() -> int:
