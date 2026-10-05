@@ -29,6 +29,7 @@ _ALLOWED_FIELDS = {
     "dwell_min",
     "dwell_max",
     "max_skips",
+    "dropout_runs",
 }
 
 _REQUIRED_FIELDS = (
@@ -70,6 +71,9 @@ def align_from_payload(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         kwargs["dwell_max"] = payload["dwell_max"]
     if "max_skips" in payload:
         kwargs["max_skips"] = payload["max_skips"]
+    if "dropout_runs" in payload:
+        # 形状与取值合法性由 solve_alignment 统一校验（失败 -> 400）。
+        kwargs["dropout_runs"] = payload["dropout_runs"]
 
     try:
         result = solve_alignment(**kwargs)

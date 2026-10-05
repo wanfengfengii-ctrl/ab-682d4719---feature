@@ -13,7 +13,18 @@
   ``|O[t] - L| <= residual_limit``；
 * 每级停留采样数范围 ``[dwell_min, dwell_max]``（1 <= ... <= 3）；
 * 最多 ``max_skips`` 个内部跳过（0..2，默认 2；跳过的是参考电平，
-  且只能发生在首尾之间）。
+  且只能发生在首尾之间）；
+* 可选 ``dropout_runs``：1..3 个互不重叠、按起点升序排列的零基半开
+  采样区间 ``[start, end)``，无效采样总数不超过 6。缺口样本：
+
+  - 仍计入停留长度（占用时间位置）；
+  - 恰好整体归属一个采用电平，采样边界不得切开任何缺口
+    （边界可以落在缺口端点 ``start`` / ``end`` 上）；
+  - 不参与残差（既不贡献残差和/最大残差，也不参与残差上限校验）；
+  - 每个采用电平仍须至少包含一个有效样本。
+
+  只有“切开缺口”或“让某级完全由无效样本支撑”才能对齐时，
+  按普通无解处理（``feasible=False``）。
 
 求解：联合选择一个整数漂移 d、一个**必含首尾**的参考子序列
 ``R[i_0]=R[0], R[i_1], ..., R[i_{k-1}]=R[R-1]``（相邻索引严格递增）
@@ -46,6 +57,10 @@
 * **边界序列编码**：边界均在 1..60，以 64 为基编码为单个整数，
   同级数（同跳过数）下整数大小次序恰为边界序列字典序，
   追加边界即 ``code = code * 64 + j``。
+* **缺口处理**：块预计算只取块内有效样本（缺口样本被剔除），因此
+  可行漂移区间、残差和/最大值天然不计占位样本；全为无效样本的块不入表，
+  等价于禁止“整级无效”。DP 扩展每个块前再做一次“不切开缺口”检查：
+  块边界严格落在某缺口内部即丢弃，边界与缺口端点重合则允许。
 """
 
 from __future__ import annotations
@@ -59,6 +74,12 @@ class AlignmentError(ValueError):
 
 # 漂移闭区间允许的最大宽度（drift_max - drift_min）。
 DRIFT_WIDTH_MAX = 2000
+
+# dropout_runs 允许的最大区间数。
+DROPOUT_RUNS_MAX = 3
+
+# 无效采样总数上限。
+DROPOUT_SAMPLES_MAX = 6
 
 # (skipped, residual_sum, residual_max, drift, boundary_code)
 Cost = Tuple[int, int, int, int, int]
@@ -78,12 +99,17 @@ def solve_alignment(
     dwell_min: int = 1,
     dwell_max: int = 3,
     max_skips: int = 2,
+    dropout_runs: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> dict:
     """求最优联合对齐。
 
     成功返回含 ``feasible=True`` 的结果字典（漂移、逐级采样区间、
     残差证据、残差和/最大残差、跳过信息）；任何合法对齐都不存在时
     返回 ``{"feasible": False, ...}``；非法输入抛 :class:`AlignmentError`。
+
+    ``dropout_runs`` 为可选的无效采样区间序列（零基半开区间
+    ``(start, end)``），约束见模块文档字符串；缺口样本保留时间占位、
+    整体归属一个采用电平、但不参与残差。
     """
     _validate_inputs(
         reference,
@@ -95,10 +121,18 @@ def solve_alignment(
         dwell_max,
         max_skips,
     )
+    drop_mask = _validate_dropout_runs(dropout_runs, len(observations))
 
     R = len(reference)
     N = len(observations)
     lim = residual_limit
+
+    # 归一化缺口区间（校验后为有序、不重叠的 [a, b) 列表）。
+    dropout_norm: List[Tuple[int, int]] = (
+        [(int(a), int(b)) for a, b in dropout_runs]
+        if dropout_runs is not None
+        else []
+    )
 
     # 级数上下界（首尾必用、至多 max_skips 个内部跳过）。
     min_levels = R - max_skips
@@ -107,7 +141,9 @@ def solve_alignment(
         return _infeasible_result()
 
     # 预计算每个 (i, j, L) 块的可行漂移区间与中心化残差 c_t = O[t]-R[i]。
-    # blocks[(i, j, L)] = (feas_lo, feas_hi, (c_{j-L}, ..., c_{j-1}))
+    # 缺口样本不参与可行性与残差，故区间与 c 序列只包含块内有效样本；
+    # 块仍须至少含一个有效样本（每级不能完全由无效采样支撑）。
+    # blocks[(i, j, L)] = (feas_lo, feas_hi, (有效样本的 c, ...))
     blocks: Dict[Tuple[int, int, int], Tuple[int, int, Tuple[int, ...]]] = {}
     for i in range(R):
         ri = reference[i]
@@ -116,8 +152,25 @@ def solve_alignment(
                 s = j - L
                 if s < 0:
                     continue
-                cs = tuple(observations[t] - ri for t in range(s, j))
+                cs = tuple(
+                    observations[t] - ri
+                    for t in range(s, j)
+                    if not drop_mask[t]
+                )
+                if not cs:
+                    continue
                 blocks[(i, j, L)] = (max(cs) - lim, min(cs) + lim, cs)
+
+    def _block_split_free(s: int, j: int) -> bool:
+        """半开块 [s, j) 未切开任何缺口（可整体归属一个采用电平）。
+
+        切开当且仅当块边界 s/j 严格落在某缺口 (a, b) 内部；边界与缺口
+        端点重合（块整体包含缺口或与之不相交）均合法。
+        """
+        for a, b in dropout_norm:
+            if a < s < b or a < j < b:
+                return False
+        return True
 
     def first_block_intervals() -> List[Tuple[int, int]]:
         # 首级停留 j 个采样后，余下观测必须还能铺够最少末前级数。
@@ -126,8 +179,12 @@ def solve_alignment(
         for j in range(dwell_min, dwell_max + 1):
             if N - j < later_min * dwell_min:
                 continue
-            lo, hi, _ = blocks[(0, j, j)]
-            out.append((lo, hi))
+            if not _block_split_free(0, j):
+                continue
+            block = blocks.get((0, j, j))
+            if block is None:
+                continue
+            out.append((block[0], block[1]))
         return _merge_intervals(out)
 
     def last_block_intervals() -> List[Tuple[int, int]]:
@@ -137,8 +194,12 @@ def solve_alignment(
             start = N - L
             if start < earlier_min * dwell_min:
                 continue
-            lo, hi, _ = blocks[(R - 1, N, L)]
-            out.append((lo, hi))
+            if not _block_split_free(start, N):
+                continue
+            block = blocks.get((R - 1, N, L))
+            if block is None:
+                continue
+            out.append((block[0], block[1]))
         return _merge_intervals(out)
 
     intervals = _intersect_interval_lists(
@@ -169,7 +230,12 @@ def solve_alignment(
 
             # 首级 i = 0。
             for j in range(dwell_min, min(dwell_max, N) + 1):
-                lo, hi, cs = blocks[(0, j, j)]
+                if not _block_split_free(0, j):
+                    continue
+                block = blocks.get((0, j, j))
+                if block is None:
+                    continue
+                lo, hi, cs = block
                 if not (lo <= d <= hi):
                     continue
                 bsum, bmax = _block_stats(cs, d)
@@ -201,7 +267,12 @@ def solve_alignment(
                         prev_j = j - L
                         if prev_j <= 0:
                             continue
-                        lo, hi, cs = blocks[(i, j, L)]
+                        if not _block_split_free(prev_j, j):
+                            continue
+                        block = blocks.get((i, j, L))
+                        if block is None:
+                            continue
+                        lo, hi, cs = block
                         if not (lo <= d <= hi):
                             continue
                         bsum, bmax = _block_stats(cs, d)
@@ -239,7 +310,13 @@ def solve_alignment(
 
     used_indices, dwells = best_solution
     return _build_result(
-        reference, observations, best_cost, used_indices, dwells
+        reference,
+        observations,
+        best_cost,
+        used_indices,
+        dwells,
+        drop_mask,
+        dropout_norm,
     )
 
 
@@ -333,8 +410,18 @@ def _build_result(
     cost: Cost,
     used_indices: List[int],
     dwells: List[int],
+    drop_mask: Optional[Sequence[bool]] = None,
+    dropout_norm: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> dict:
     skipped, residual_sum, max_abs, drift, _code = cost
+    drop_mask = drop_mask or [False] * len(observations)
+    dropout_norm = list(dropout_norm or [])
+    # 每个采样归属的缺口序号（在 dropout_norm 中的下标），无则 -1。
+    run_of = [-1] * len(observations)
+    for run_idx, (a, b) in enumerate(dropout_norm):
+        for t in range(a, b):
+            run_of[t] = run_idx
+
     boundaries: List[int] = []
     acc = 0
     for L in dwells:
@@ -345,13 +432,33 @@ def _build_result(
     levels_out = []
     residual_sum_check = 0
     max_abs_check = 0
+    ignored_total = 0
     sample_t = 0
     for slot, (ri, L) in enumerate(zip(used_indices, dwells)):
         adopted = reference[ri] + drift
         s = sample_t
         e = sample_t + L
         samples = []
+        level_runs: List[int] = []
         for t in range(s, e):
+            if drop_mask[t]:
+                run_idx = run_of[t]
+                if not level_runs or level_runs[-1] != run_idx:
+                    level_runs.append(run_idx)
+                ignored_total += 1
+                # 占位样本：仍在逐样本证据中保留时间位置，但残差为 null，
+                # 不参与残差和/最大残差，亦不参与越限裁决。
+                samples.append(
+                    {
+                        "index": t,
+                        "observed": observations[t],
+                        "residual": None,
+                        "ignored": True,
+                        "ignored_reason": "dropout",
+                        "dropout_run": run_idx,
+                    }
+                )
+                continue
             r = observations[t] - adopted
             ar = abs(r)
             residual_sum_check += ar
@@ -360,18 +467,27 @@ def _build_result(
             samples.append(
                 {"index": t, "observed": observations[t], "residual": r}
             )
-        levels_out.append(
-            {
-                "level_order": slot,
-                "reference_index": ri,
-                "reference_level": reference[ri],
-                "adopted_level": adopted,
-                "sample_start": s,
-                "sample_end": e,
-                "dwell": L,
-                "samples": samples,
-            }
-        )
+        level_entry = {
+            "level_order": slot,
+            "reference_index": ri,
+            "reference_level": reference[ri],
+            "adopted_level": adopted,
+            "sample_start": s,
+            "sample_end": e,
+            "dwell": L,
+            "samples": samples,
+        }
+        if level_runs:
+            level_entry["ignored_dropout_runs"] = [
+                {
+                    "dropout_run": run_idx,
+                    "sample_start": dropout_norm[run_idx][0],
+                    "sample_end": dropout_norm[run_idx][1],
+                    "level_order": slot,
+                }
+                for run_idx in level_runs
+            ]
+        levels_out.append(level_entry)
         sample_t = e
 
     used_set = set(used_indices)
@@ -383,8 +499,19 @@ def _build_result(
     assert skipped == len(skipped_indices)
     assert used_indices[0] == 0
     assert used_indices[-1] == len(reference) - 1
+    if dropout_norm:
+        # 每个缺口必须恰好整体归属一个采用电平。
+        assert ignored_total == sum(b - a for a, b in dropout_norm)
+        for slot, lv in enumerate(levels_out):
+            for run_idx in [
+                run_of[t]
+                for t in range(lv["sample_start"], lv["sample_end"])
+                if drop_mask[t]
+            ]:
+                a, b = dropout_norm[run_idx]
+                assert lv["sample_start"] <= a and b <= lv["sample_end"]
 
-    return {
+    result = {
         "feasible": True,
         "drift": drift,
         "num_skips": skipped,
@@ -395,6 +522,23 @@ def _build_result(
         "num_levels_used": len(used_indices),
         "levels": levels_out,
     }
+    if dropout_norm:
+        # 顶层汇总：按请求顺序列出被忽略缺口及其归属电平。
+        level_of_run = {}
+        for lv in levels_out:
+            for info in lv.get("ignored_dropout_runs", []):
+                level_of_run[info["dropout_run"]] = lv["level_order"]
+        result["dropout_runs"] = [
+            {
+                "dropout_run": run_idx,
+                "sample_start": a,
+                "sample_end": b,
+                "level_order": level_of_run[run_idx],
+                "ignored": True,
+            }
+            for run_idx, (a, b) in enumerate(dropout_norm)
+        ]
+    return result
 
 
 def _infeasible_result() -> dict:
@@ -462,3 +606,56 @@ def _validate_inputs(
     for x in list(reference) + list(observations):
         if abs(x) > 1_000_000_000:
             raise AlignmentError("电平/观测值超出允许范围 (+/-1e9)")
+
+
+def _validate_dropout_runs(
+    dropout_runs: Optional[Sequence[Tuple[int, int]]], n: int
+) -> List[bool]:
+    """校验 dropout_runs 并返回逐采样缺口掩码。
+
+    规则：字段缺省（None）表示无缺口；否则必须为 1..3 项的数组，每项为
+    零基半开区间 ``[start, end)``（整数、0 <= start < end <= N），区间按
+    起点升序、互不重叠（允许端点相接），无效采样总数 <= 6。
+    任何违反均抛 :class:`AlignmentError`（对应 HTTP 400 字段拒绝）。
+    """
+    mask = [False] * n
+    if dropout_runs is None:
+        return mask
+
+    if not isinstance(dropout_runs, (list, tuple)):
+        raise AlignmentError("dropout_runs 必须是区间数组")
+    if not 1 <= len(dropout_runs) <= DROPOUT_RUNS_MAX:
+        raise AlignmentError(
+            f"dropout_runs 必须包含 1 至 {DROPOUT_RUNS_MAX} 个区间"
+        )
+
+    total = 0
+    prev_end = 0
+    for idx, run in enumerate(dropout_runs):
+        if not isinstance(run, (list, tuple)) or len(run) != 2:
+            raise AlignmentError(
+                f"dropout_runs[{idx}] 必须是 [start, end] 形式的区间"
+            )
+        start, end = run
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise AlignmentError(f"dropout_runs[{idx}].start 必须为整数")
+        if isinstance(end, bool) or not isinstance(end, int):
+            raise AlignmentError(f"dropout_runs[{idx}].end 必须为整数")
+        if not 0 <= start < end <= n:
+            raise AlignmentError(
+                f"dropout_runs[{idx}] 越界：要求 0 <= start < end <= {n}"
+            )
+        if idx > 0 and start < prev_end:
+            raise AlignmentError(
+                "dropout_runs 区间必须互不重叠且按起点升序排列"
+            )
+        for t in range(start, end):
+            mask[t] = True
+        total += end - start
+        prev_end = end
+
+    if total > DROPOUT_SAMPLES_MAX:
+        raise AlignmentError(
+            f"无效采样总数不得超过 {DROPOUT_SAMPLES_MAX} 个"
+        )
+    return mask

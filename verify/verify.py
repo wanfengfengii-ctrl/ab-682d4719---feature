@@ -8,7 +8,11 @@
 3. HTTP 冒烟：对运行中的 API 提交
    - 一条可行轨迹（期望 feasible=true、漂移/区间/残差证据齐全），
    - 一条无解轨迹（期望 feasible=false 且给出明确结论），
-   - 一条非法请求（期望 HTTP 400）。
+   - 一条非法请求（期望 HTTP 400），
+   - 一条带 dropout_runs 的缺口可行轨迹（期望占位保留、不参与残差、
+     缺口整体归属唯一电平、证据中标注缺口及归属），
+   - 一条只能切开缺口/整级无效的缺口无解轨迹（期望 feasible=false），
+   - 一条缺口字段非法（区间重叠）的请求（期望 HTTP 400）。
 
 API 地址取环境变量 ``API_BASE_URL``（compose 中为 http://api:8000）；
 若该地址不可达且未显式要求使用远端服务，则在本地以随机端口临时启动
@@ -55,6 +59,38 @@ INVALID_CASE: Dict[str, Any] = {
     "drift_min": 0,
     "drift_max": 0,
     "residual_limit": 0,
+}
+
+# 缺口可行例：索引 2、3 为量程复位留下的无效占位，与索引 4 同属一个
+# 采用电平（停留 3）；占位值取极端垃圾值，验证其不参与残差。
+DROPOUT_FEASIBLE_CASE: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [15, 25, 999999, 999999, 35, 45, 55, 65, 75, 85],
+    "drift_min": -10,
+    "drift_max": 10,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 3,
+    "dropout_runs": [[2, 4]],
+}
+
+# 缺口无解例：每级固定 1 采样，长度 2 的缺口只能被边界切开（或让某级
+# 完全由无效样本支撑），按既有语义返回 feasible=false 明确结论。
+DROPOUT_INFEASIBLE_CASE: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [15, 25, 35, 45, 55, 65, 75, 85],
+    "drift_min": -10,
+    "drift_max": 10,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 1,
+    "dropout_runs": [[2, 4]],
+}
+
+# 缺口字段非法例：两个区间互相重叠，应按字段拒绝（HTTP 400）。
+DROPOUT_INVALID_CASE: Dict[str, Any] = {
+    **DROPOUT_FEASIBLE_CASE,
+    "dropout_runs": [[2, 5], [4, 6]],
 }
 
 
@@ -212,6 +248,54 @@ def stage_http_smoke(base_url: str) -> None:
     if status != 400:
         raise StageFailure(f"非法请求应返回 400，实际 status={status}")
     _log("smoke", "非法请求通过: 返回 HTTP 400 拒绝")
+
+    # ---- dropout_runs 缺口场景 ----
+    status, body = _http_request(base_url, DROPOUT_FEASIBLE_CASE)
+    n_obs = len(DROPOUT_FEASIBLE_CASE["observations"])
+    if status != 200 or not body.get("feasible"):
+        raise StageFailure(f"缺口可行用例失败: status={status} body={body}")
+    all_samples = [s for lv in body["levels"] for s in lv["samples"]]
+    if [s["index"] for s in all_samples] != list(range(n_obs)):
+        raise StageFailure("缺口用例逐样本证据未保留全部时间占位")
+    ignored = [s for s in all_samples if s.get("ignored")]
+    if [s["index"] for s in ignored] != [2, 3]:
+        raise StageFailure("缺口用例被忽略样本与请求区间不一致")
+    for s in ignored:
+        if s.get("residual") is not None:
+            raise StageFailure("缺口占位样本不得参与残差（residual 必须为 null）")
+        if s.get("dropout_run") != 0:
+            raise StageFailure("缺口占位样本缺少归属编号")
+    for lv in body["levels"]:
+        if all(s.get("ignored") for s in lv["samples"]):
+            raise StageFailure("存在完全由无效样本支撑的采用电平")
+    runs = body.get("dropout_runs")
+    if runs != [
+        {
+            "dropout_run": 0,
+            "sample_start": 2,
+            "sample_end": 4,
+            "level_order": 2,
+            "ignored": True,
+        }
+    ]:
+        raise StageFailure(f"缺口归属标注不正确: {runs}")
+    if body.get("residual_sum") != 0:
+        raise StageFailure("占位垃圾值污染了残差汇总")
+    _log("smoke", "缺口可行用例通过: 占位保留、不参与残差、归属唯一电平")
+
+    status, body = _http_request(base_url, DROPOUT_INFEASIBLE_CASE)
+    if status != 200 or body.get("feasible") is not False:
+        raise StageFailure(f"缺口无解用例失败: status={status} body={body}")
+    if body.get("reason") != "no_alignment_exists":
+        raise StageFailure("缺口无解用例缺少既有明确结论 reason")
+    _log("smoke", "缺口无解用例通过: 只能切开缺口时返回 feasible=false")
+
+    status, body = _http_request(base_url, DROPOUT_INVALID_CASE)
+    if status != 400:
+        raise StageFailure(
+            f"重叠缺口区间应按字段拒绝返回 400，实际 status={status}"
+        )
+    _log("smoke", "缺口非法用例通过: 重叠区间返回 HTTP 400")
 
 
 def main() -> int:

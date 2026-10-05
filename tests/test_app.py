@@ -31,6 +31,35 @@ INFEASIBLE_PAYLOAD: Dict[str, Any] = {
     "residual_limit": 1,
 }
 
+# 两个无效占位样本（索引 2、3）与第 2 个有效观测同属一级（停留 3）。
+DROPOUT_FEASIBLE_PAYLOAD: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [15, 25, 999999, 999999, 35, 45, 55, 65, 75, 85],
+    "drift_min": -10,
+    "drift_max": 10,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 3,
+    "dropout_runs": [[2, 4]],
+}
+
+# 每级固定 1 采样，长度 2 的缺口必然被边界切开（或整级无效）-> 无解。
+DROPOUT_INFEASIBLE_PAYLOAD: Dict[str, Any] = {
+    "reference_levels": [10, 20, 30, 40, 50, 60, 70, 80],
+    "observations": [15, 25, 35, 45, 55, 65, 75, 85],
+    "drift_min": -10,
+    "drift_max": 10,
+    "residual_limit": 2,
+    "dwell_min": 1,
+    "dwell_max": 1,
+    "dropout_runs": [[2, 4]],
+}
+
+DROPOUT_INVALID_PAYLOAD: Dict[str, Any] = {
+    **DROPOUT_FEASIBLE_PAYLOAD,
+    "dropout_runs": [[2, 5], [4, 6]],  # 互相重叠
+}
+
 
 class AlignFromPayloadTests(unittest.TestCase):
     def test_feasible(self) -> None:
@@ -80,6 +109,68 @@ class AlignFromPayloadTests(unittest.TestCase):
         status, body = align_from_payload("not-a-dict")
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "invalid_body")
+
+    def test_dropout_feasible(self) -> None:
+        status, body = align_from_payload(DROPOUT_FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["drift"], 5)
+        self.assertEqual(body["residual_sum"], 0)
+        # 占位样本仍在逐样本证据中，且残差为 null、不进汇总。
+        covered = [
+            s["index"] for lv in body["levels"] for s in lv["samples"]
+        ]
+        self.assertEqual(covered, list(range(10)))
+        ignored = [
+            s
+            for lv in body["levels"]
+            for s in lv["samples"]
+            if s.get("ignored")
+        ]
+        self.assertEqual([s["index"] for s in ignored], [2, 3])
+        for s in ignored:
+            self.assertIsNone(s["residual"])
+            self.assertEqual(s["dropout_run"], 0)
+        # 每级至少一个有效样本。
+        for lv in body["levels"]:
+            self.assertTrue(any(not s.get("ignored") for s in lv["samples"]))
+        self.assertEqual(
+            body["dropout_runs"],
+            [
+                {
+                    "dropout_run": 0,
+                    "sample_start": 2,
+                    "sample_end": 4,
+                    "level_order": 2,
+                    "ignored": True,
+                }
+            ],
+        )
+
+    def test_dropout_infeasible_is_explicit_conclusion(self) -> None:
+        status, body = align_from_payload(DROPOUT_INFEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"], "no_alignment_exists")
+
+    def test_dropout_overlap_rejected_as_field_error(self) -> None:
+        status, body = align_from_payload(DROPOUT_INVALID_PAYLOAD)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_dropout_out_of_range_rejected(self) -> None:
+        bad = dict(DROPOUT_FEASIBLE_PAYLOAD)
+        bad["dropout_runs"] = [[2, 11]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_dropout_count_cap_rejected(self) -> None:
+        bad = dict(DROPOUT_FEASIBLE_PAYLOAD)
+        bad["dropout_runs"] = [[0, 1], [2, 3], [4, 5], [6, 7]]
+        status, body = align_from_payload(bad)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_request")
 
 
 class HttpEndToEndTests(unittest.TestCase):
@@ -136,6 +227,19 @@ class HttpEndToEndTests(unittest.TestCase):
         status, body = self._post(INFEASIBLE_PAYLOAD)
         self.assertEqual(status, 200)
         self.assertFalse(body["feasible"])
+
+    def test_dropout_roundtrip(self) -> None:
+        status, body = self._post(DROPOUT_FEASIBLE_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["feasible"])
+        ignored = [
+            s["index"]
+            for lv in body["levels"]
+            for s in lv["samples"]
+            if s.get("ignored")
+        ]
+        self.assertEqual(ignored, [2, 3])
+        self.assertEqual(body["dropout_runs"][0]["level_order"], 2)
 
     def test_invalid_roundtrip(self) -> None:
         bad = dict(FEASIBLE_PAYLOAD)
